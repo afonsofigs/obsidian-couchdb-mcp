@@ -60,12 +60,15 @@ async function couchFetch(path, options = {}) {
 // Fixed IDs to ignore: "obsydian_livesync_version", "syncinfo"
 
 async function readNoteContent(doc) {
-  // Plain docs: content is inline
-  if (doc.type === "plain" || !doc.children || doc.children.length === 0) {
+  // If doc has children, content is in chunks — regardless of type field
+  const hasChildren = Array.isArray(doc.children) && doc.children.length > 0;
+
+  if (!hasChildren) {
+    // No chunks: content is inline in data field
     return doc.data || "";
   }
 
-  // Check eden (inline chunks) first
+  // Check eden (inline chunks embedded in the doc itself) first
   if (doc.eden && Object.keys(doc.eden).length > 0) {
     const edenChunks = [];
     for (const childId of doc.children) {
@@ -80,7 +83,7 @@ async function readNoteContent(doc) {
     return edenChunks.join("");
   }
 
-  // newnote: reassemble from children chunk documents
+  // Reassemble from children chunk documents in CouchDB
   const chunks = [];
   for (const childId of doc.children) {
     const { status, body } = await couchFetch(`/${encodeURIComponent(childId)}`);
@@ -91,6 +94,23 @@ async function readNoteContent(doc) {
     }
   }
   return chunks.join("");
+}
+
+// Resolve a note path to its CouchDB document.
+// LiveSync case-insensitive mode stores _id in lowercase but path in original case.
+// Try exact _id first, then fall back to lowercase _id.
+async function resolveNote(path) {
+  const { status, body } = await couchFetch(`/${encodeURIComponent(path)}`);
+  if (status === 200) return { status, body };
+
+  // Try lowercase (case-insensitive mode)
+  const lower = path.toLowerCase();
+  if (lower !== path) {
+    const { status: s2, body: b2 } = await couchFetch(`/${encodeURIComponent(lower)}`);
+    if (s2 === 200) return { status: s2, body: b2 };
+  }
+
+  return { status: 404, body: null };
 }
 
 // LiveSync internal doc IDs to exclude from note listings
@@ -262,7 +282,7 @@ function createMcpServer() {
     },
     async ({ path }) => {
       try {
-        const { status, body } = await couchFetch(`/${encodeURIComponent(path)}`);
+        const { status, body } = await resolveNote(path);
         if (status === 404) {
           return { content: [{ type: "text", text: `Note not found: ${path}` }], isError: true };
         }
@@ -385,11 +405,14 @@ function createMcpServer() {
         const now = Date.now();
 
         // Check if doc already exists (need _rev for update)
-        const { status, body: existing } = await couchFetch(`/${encodeURIComponent(path)}`);
+        const { status, body: existing } = await resolveNote(path);
+
+        // Use the resolved _id (may be lowercase in case-insensitive mode)
+        const docId = (status === 200 && existing._id) ? existing._id : path;
 
         // LiveSync MetadataDocument format
         const doc = {
-          _id: path,
+          _id: docId,
           path: path,
           data: noteContent,
           ctime: existing?.ctime || now,
@@ -404,7 +427,7 @@ function createMcpServer() {
           doc._rev = existing._rev;
         }
 
-        const { status: putStatus, body: putBody } = await couchFetch(`/${encodeURIComponent(path)}`, {
+        const { status: putStatus, body: putBody } = await couchFetch(`/${encodeURIComponent(docId)}`, {
           method: "PUT",
           body: JSON.stringify(doc),
         });
@@ -433,7 +456,7 @@ function createMcpServer() {
     },
     async ({ path }) => {
       try {
-        const { status, body } = await couchFetch(`/${encodeURIComponent(path)}`);
+        const { status, body } = await resolveNote(path);
         if (status === 404) {
           return { content: [{ type: "text", text: `Note not found: ${path}` }], isError: true };
         }
@@ -441,7 +464,7 @@ function createMcpServer() {
         // Only delete the metadata doc — chunks are immutable and shared.
         // LiveSync handles chunk garbage collection.
         const { body: delBody } = await couchFetch(
-          `/${encodeURIComponent(path)}?rev=${body._rev}`,
+          `/${encodeURIComponent(body._id)}?rev=${body._rev}`,
           { method: "DELETE" }
         );
 
@@ -468,7 +491,7 @@ function createMcpServer() {
     },
     async ({ path }) => {
       try {
-        const { status, body } = await couchFetch(`/${encodeURIComponent(path)}`);
+        const { status, body } = await resolveNote(path);
         if (status === 404) {
           return { content: [{ type: "text", text: `Note not found: ${path}` }], isError: true };
         }
