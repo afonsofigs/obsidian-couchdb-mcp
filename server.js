@@ -407,8 +407,9 @@ function createMcpServer() {
         // Check if doc already exists (need _rev for update)
         const { status, body: existing } = await resolveNote(path);
 
-        // Use the resolved _id (may be lowercase in case-insensitive mode)
-        const docId = (status === 200 && existing._id) ? existing._id : path;
+        // _id is always lowercase (LiveSync case-insensitive mode)
+        // path preserves original casing (used by LiveSync to create the file)
+        const docId = (status === 200 && existing._id) ? existing._id : path.toLowerCase();
 
         // LiveSync MetadataDocument format
         const doc = {
