@@ -453,7 +453,7 @@ function createMcpServer() {
           data: "",
           ctime: existing?.ctime || now,
           mtime: now,
-          size: noteContent.length,
+          size: Buffer.byteLength(noteContent, "utf-8"),
           type: "plain",
           children: children,
           eden: {},
