@@ -96,6 +96,38 @@ async function readNoteContent(doc) {
   return chunks.join("");
 }
 
+// Create leaf chunk documents in CouchDB for note content.
+// LiveSync ALWAYS stores content in chunks — the metadata doc's `data` field must be empty.
+// Returns array of chunk document IDs.
+async function writeChunks(content) {
+  // Split into ~250KB chunks (CouchDB max_document_size is typically 50MB, but smaller is better for sync)
+  const CHUNK_SIZE = 250_000;
+  const chunkIds = [];
+
+  for (let i = 0; i < content.length; i += CHUNK_SIZE) {
+    const chunkData = content.slice(i, i + CHUNK_SIZE);
+    // Generate chunk ID using content hash (same as LiveSync: h: prefix + hash)
+    const hash = createHash("sha1").update(chunkData).digest("hex").slice(0, 12);
+    const chunkId = `h:${hash}${i.toString(36)}`;
+
+    // Check if chunk already exists (content-addressable)
+    const { status } = await couchFetch(`/${encodeURIComponent(chunkId)}`);
+    if (status !== 200) {
+      await couchFetch(`/${encodeURIComponent(chunkId)}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          _id: chunkId,
+          data: chunkData,
+          type: "leaf",
+        }),
+      });
+    }
+    chunkIds.push(chunkId);
+  }
+
+  return chunkIds;
+}
+
 // Resolve a note path to its CouchDB document.
 // LiveSync case-insensitive mode stores _id in lowercase but path in original case.
 // Try exact _id first, then fall back to lowercase _id.
@@ -411,16 +443,19 @@ function createMcpServer() {
         // path preserves original casing (used by LiveSync to create the file)
         const docId = (status === 200 && existing._id) ? existing._id : path.toLowerCase();
 
+        // LiveSync requires content in chunk documents — metadata data field must be empty
+        const children = await writeChunks(noteContent);
+
         // LiveSync MetadataDocument format
         const doc = {
           _id: docId,
           path: path,
-          data: noteContent,
+          data: "",
           ctime: existing?.ctime || now,
           mtime: now,
           size: noteContent.length,
           type: "plain",
-          children: [],
+          children: children,
           eden: {},
         };
 
