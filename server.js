@@ -128,18 +128,36 @@ async function writeChunks(content) {
   return chunkIds;
 }
 
+// Sanitize a path for use as CouchDB _id: lowercase, no accents.
+// LiveSync case-insensitive mode requires lowercase _id.
+// Accented characters in filenames can cause filesystem issues when LiveSync creates files.
+function sanitizePath(path) {
+  return path
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, ""); // strip combining diacritical marks
+}
+
 // Resolve a note path to its CouchDB document.
 // LiveSync case-insensitive mode stores _id in lowercase but path in original case.
 // Try exact _id first, then fall back to lowercase _id.
 async function resolveNote(path) {
+  // Try exact path first
   const { status, body } = await couchFetch(`/${encodeURIComponent(path)}`);
   if (status === 200) return { status, body };
 
-  // Try lowercase (case-insensitive mode)
-  const lower = path.toLowerCase();
-  if (lower !== path) {
-    const { status: s2, body: b2 } = await couchFetch(`/${encodeURIComponent(lower)}`);
+  // Try sanitized (lowercase + no accents)
+  const sanitized = sanitizePath(path);
+  if (sanitized !== path) {
+    const { status: s2, body: b2 } = await couchFetch(`/${encodeURIComponent(sanitized)}`);
     if (s2 === 200) return { status: s2, body: b2 };
+  }
+
+  // Try just lowercase (for docs with accents in _id)
+  const lower = path.toLowerCase();
+  if (lower !== path && lower !== sanitized) {
+    const { status: s3, body: b3 } = await couchFetch(`/${encodeURIComponent(lower)}`);
+    if (s3 === 200) return { status: s3, body: b3 };
   }
 
   return { status: 404, body: null };
@@ -436,12 +454,14 @@ function createMcpServer() {
       try {
         const now = Date.now();
 
+        // Strip accents from path (accented filenames cause sync issues)
+        // Keep casing for path field, lowercase for _id
+        const stripAccents = (s) => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+        const safePath = stripAccents(path);
+
         // Check if doc already exists (need _rev for update)
         const { status, body: existing } = await resolveNote(path);
-
-        // _id is always lowercase (LiveSync case-insensitive mode)
-        // path preserves original casing (used by LiveSync to create the file)
-        const docId = (status === 200 && existing._id) ? existing._id : path.toLowerCase();
+        const docId = (status === 200 && existing._id) ? existing._id : sanitizePath(path);
 
         // LiveSync requires content in chunk documents — metadata data field must be empty
         const children = await writeChunks(noteContent);
@@ -449,7 +469,7 @@ function createMcpServer() {
         // LiveSync MetadataDocument format
         const doc = {
           _id: docId,
-          path: path,
+          path: safePath,
           data: "",
           ctime: existing?.ctime || now,
           mtime: now,
