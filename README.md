@@ -1,20 +1,16 @@
 # obsidian-couchdb-mcp
 
-Self-hosted [MCP](https://modelcontextprotocol.io/) server for reading and writing [Obsidian](https://obsidian.md/) notes via [CouchDB](https://couchdb.apache.org/) ([Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-livesync)). Designed as a remote connector for [Claude.ai](https://claude.ai) scheduled tasks.
+OAuth 2.1 proxy for [obsidian-sync-mcp](https://github.com/es617/obsidian-sync-mcp), making it compatible with [Claude.ai](https://claude.ai) remote connectors and scheduled tasks.
 
-OAuth 2.1 wrapper around [obsidian-sync-mcp](https://github.com/es617/obsidian-sync-mcp)'s vault backend, which uses [livesync-commonlib](https://github.com/vrtmrz/livesync-commonlib) for correct LiveSync format handling (chunks, encryption, soft-deletes).
-
-## Why?
-
-`obsidian-sync-mcp` exists but uses FastMCP with password auth — incompatible with Claude.ai connectors (which require OAuth 2.1). This project wraps their vault backend with OAuth 2.1 + Streamable HTTP, making it work as a Claude.ai remote connector.
+`obsidian-sync-mcp` provides excellent Obsidian vault access via CouchDB/LiveSync, but uses FastMCP with password auth — incompatible with Claude.ai connectors (which require OAuth 2.1). This project wraps it with OAuth 2.1 + Streamable HTTP in a single Docker image.
 
 ## Features
 
-- **8 tools**: `read_note`, `write_note`, `delete_note`, `move_note`, `list_notes`, `search_notes`, `get_note_metadata`, `recent_notes`
+- **All obsidian-sync-mcp tools**: `read_note`, `write_note`, `edit_note`, `delete_note`, `move_note`, `list_notes`, `list_folders`, `list_tags`, `get_note_metadata`
 - **OAuth 2.1**: Fixed client credentials — works with Claude.ai connectors and scheduled tasks
-- **livesync-commonlib**: Official library for LiveSync document format (no manual chunk/format handling)
-- **E2E encryption**: Supported via `COUCHDB_PASSPHRASE`
-- **Docker**: Ready to deploy on K8s, Fly.io, Railway, etc.
+- **Dynamic tool discovery**: New tools from obsidian-sync-mcp updates appear automatically
+- **LiveSync compatible**: Powered by [livesync-commonlib](https://github.com/vrtmrz/livesync-commonlib) (chunks, encryption, soft-deletes)
+- **Single Docker image**: Both OAuth proxy and backend in one container
 
 ## Quick Start
 
@@ -24,7 +20,7 @@ OAuth 2.1 wrapper around [obsidian-sync-mcp](https://github.com/es617/obsidian-s
 docker run -d \
   -e COUCHDB_URL=https://your-couchdb.example.com \
   -e COUCHDB_DATABASE=obsidian \
-  -e COUCHDB_USERNAME=your_user \
+  -e COUCHDB_USER=your_user \
   -e COUCHDB_PASSWORD=your_password \
   -e MCP_SECRET=your_secret_here \
   -e SERVER_URL=https://your-domain.com \
@@ -38,14 +34,9 @@ docker run -d \
 git clone https://github.com/afonsofigs/obsidian-couchdb-mcp.git
 cd obsidian-couchdb-mcp
 npm install
-
-COUCHDB_URL=http://localhost:5984 \
-COUCHDB_DATABASE=obsidian \
-COUCHDB_USERNAME=admin \
-COUCHDB_PASSWORD=password \
-MCP_SECRET=your_secret \
-SERVER_URL=http://localhost:3000 \
-node server.js
+COUCHDB_URL=http://localhost:5984 COUCHDB_DATABASE=obsidian \
+COUCHDB_USER=admin COUCHDB_PASSWORD=password \
+MCP_SECRET=your_secret SERVER_URL=http://localhost:3000 node server.js
 ```
 
 ## Environment Variables
@@ -55,37 +46,12 @@ node server.js
 | `COUCHDB_URL` | Yes | CouchDB base URL |
 | `MCP_SECRET` | Yes | Secret to derive OAuth credentials (printed on startup) |
 | `COUCHDB_DATABASE` | No | Database name (default: `obsidian`) |
-| `COUCHDB_USERNAME` | No | CouchDB username |
+| `COUCHDB_USER` | No | CouchDB username |
 | `COUCHDB_PASSWORD` | No | CouchDB password |
 | `COUCHDB_PASSPHRASE` | No | LiveSync E2E encryption passphrase |
 | `SERVER_URL` | Yes | Public HTTPS URL (OAuth issuer) |
-| `PORT` | No | Server port (default: 3000) |
-
-## MCP Tools
-
-### `read_note`
-Read a note by path. Handles chunked and encrypted documents via livesync-commonlib.
-
-### `write_note`
-Create or update a note. LiveSync propagates to all devices.
-
-### `delete_note`
-Delete a note (LiveSync soft-delete, propagates to all devices).
-
-### `move_note`
-Move or rename a note.
-
-### `list_notes`
-List notes, optionally filtered by folder prefix.
-
-### `search_notes`
-Full-text search across notes with excerpts.
-
-### `get_note_metadata`
-Get timestamps and size without fetching content.
-
-### `recent_notes`
-List recently modified notes, sorted by mtime.
+| `PORT` | No | OAuth proxy port (default: 3000) |
+| `BACKEND_PORT` | No | Backend port (default: 8787) |
 
 ## Authentication
 
@@ -110,18 +76,17 @@ Same pattern as [telegram-bot-mcp](https://github.com/afonsofigs/telegram-bot-mc
 Claude.ai / Scheduled Tasks
         |
         v (HTTPS + OAuth 2.1 + Streamable HTTP)
-  obsidian-couchdb-mcp (OAuth wrapper)
+  OAuth proxy :3000 (this project)
         |
-        v (obsidian-sync-mcp Vault + livesync-commonlib)
-  CouchDB (LiveSync)
+        v (HTTP + MCP, localhost)
+  obsidian-sync-mcp :8787 (livesync-commonlib)
         |
-        v (replication)
+        v (CouchDB HTTP API)
+  CouchDB (LiveSync replication)
+        |
+        v
   Obsidian Desktop/Mobile
 ```
-
-## Kubernetes
-
-See `k8s/deployment.yaml` for a K8s manifest template. Real secrets should be managed separately.
 
 ## Credits
 

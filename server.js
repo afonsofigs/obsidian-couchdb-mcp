@@ -4,64 +4,107 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import express from "express";
 import { z } from "zod";
-
-// Polyfills required by livesync-commonlib (browser globals)
-if (!("navigator" in globalThis)) globalThis.navigator = { language: "en" };
-
-// The vault's internal change watcher throws unhandled errors in headless mode.
-// Catch them to prevent process crash — the core read/write APIs still work.
-process.on("uncaughtException", (err) => {
-  if (err.message?.includes("Only absolute URLs") || err.message?.includes("watching changes")) {
-    console.log(`[vault] suppressed watcher error: ${err.message}`);
-    return;
-  }
-  console.error("[fatal]", err);
-  process.exit(1);
-});
+import { spawn } from "node:child_process";
 
 // --- Configuration ---
 
-const COUCHDB_URL = process.env.COUCHDB_URL;
-const COUCHDB_DATABASE = process.env.COUCHDB_DATABASE || "obsidian";
-const COUCHDB_USER = process.env.COUCHDB_USERNAME || process.env.COUCHDB_USER || "";
-const COUCHDB_PASSWORD = process.env.COUCHDB_PASSWORD || "";
-const COUCHDB_PASSPHRASE = process.env.COUCHDB_PASSPHRASE || undefined;
 const MCP_SECRET = process.env.MCP_SECRET;
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const SERVER_URL = process.env.SERVER_URL || `http://localhost:${PORT}`;
+const BACKEND_PORT = parseInt(process.env.BACKEND_PORT || "8787", 10);
+const BACKEND_URL = `http://127.0.0.1:${BACKEND_PORT}`;
 
-if (!COUCHDB_URL) {
-  console.error("Error: COUCHDB_URL environment variable is required");
-  process.exit(1);
-}
 if (!MCP_SECRET) {
   console.error("Error: MCP_SECRET environment variable is required");
   process.exit(1);
 }
 
-// --- Vault backend (obsidian-sync-mcp + livesync-commonlib) ---
+// --- Start obsidian-sync-mcp backend ---
 
-// Import Vault from obsidian-sync-mcp's compiled output
-// The postinstall script patches the bundle to include adapter: "http"
-// This handles all LiveSync format details: chunks, encryption, soft-deletes, etc.
-const { Vault } = await import("obsidian-sync-mcp/dist/vault-5Y35MEZS.js");
-
-const vault = new Vault({
-  url: COUCHDB_URL,
-  username: COUCHDB_USER,
-  password: COUCHDB_PASSWORD,
-  database: COUCHDB_DATABASE,
-  passphrase: COUCHDB_PASSPHRASE,
+const backend = spawn("node", ["node_modules/obsidian-sync-mcp/dist/main.js"], {
+  stdio: ["ignore", "pipe", "pipe"],
+  env: { ...process.env, PORT: String(BACKEND_PORT) },
 });
 
-try {
-  await vault.init();
-  console.log(`Vault connected: ${COUCHDB_URL}/${COUCHDB_DATABASE}`);
-} catch (err) {
-  // vault.init() may throw from watchChanges — the core API still works
-  console.log(`Vault initialized with warning: ${err.message}`);
-  console.log(`Vault: ${COUCHDB_URL}/${COUCHDB_DATABASE} (watch disabled)`);
+backend.stdout.on("data", (d) => process.stdout.write(`[backend] ${d}`));
+backend.stderr.on("data", (d) => process.stderr.write(`[backend] ${d}`));
+backend.on("exit", (code) => {
+  console.error(`[backend] obsidian-sync-mcp exited with code ${code}`);
+  process.exit(1);
+});
+
+// Wait for backend to be ready
+await new Promise((resolve) => {
+  const check = async () => {
+    try {
+      const r = await fetch(`${BACKEND_URL}/health`);
+      if (r.ok) return resolve();
+    } catch {}
+    setTimeout(check, 500);
+  };
+  check();
+});
+console.log(`Backend ready at ${BACKEND_URL}`);
+
+// --- Discover tools from backend ---
+
+async function backendMcpCall(method, params = {}) {
+  // Initialize session
+  const initRes = await fetch(`${BACKEND_URL}/mcp`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+      ...(process.env.MCP_AUTH_TOKEN ? { "Authorization": `Bearer ${process.env.MCP_AUTH_TOKEN}` } : {}),
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: "oauth-proxy", version: "2.0.0" },
+      },
+      id: 1,
+    }),
+  });
+
+  const initText = await initRes.text();
+  const sessionId = initRes.headers.get("mcp-session-id");
+
+  // Send initialized notification
+  await fetch(`${BACKEND_URL}/mcp`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+      "mcp-session-id": sessionId,
+      ...(process.env.MCP_AUTH_TOKEN ? { "Authorization": `Bearer ${process.env.MCP_AUTH_TOKEN}` } : {}),
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+  });
+
+  // Call the method
+  const res = await fetch(`${BACKEND_URL}/mcp`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+      "mcp-session-id": sessionId,
+      ...(process.env.MCP_AUTH_TOKEN ? { "Authorization": `Bearer ${process.env.MCP_AUTH_TOKEN}` } : {}),
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", method, params, id: 2 }),
+  });
+
+  const text = await res.text();
+  const match = text.match(/data: (.+)/);
+  return match ? JSON.parse(match[1]) : JSON.parse(text);
 }
+
+// Get available tools from backend
+const toolsResponse = await backendMcpCall("tools/list");
+const backendTools = toolsResponse.result?.tools || [];
+console.log(`Discovered ${backendTools.length} tools: ${backendTools.map((t) => t.name).join(", ")}`);
 
 // --- OAuth 2.1 Provider (in-memory, same pattern as telegram-bot-mcp) ---
 
@@ -197,210 +240,45 @@ class OAuthProvider {
   }
 }
 
-// --- MCP Server (tools powered by Vault backend) ---
+// --- MCP Server (proxy tools to backend) ---
 
 function createMcpServer() {
   const server = new McpServer({ name: "obsidian-couchdb-mcp", version: "2.0.0" });
 
-  // --- read_note ---
-  server.tool(
-    "read_note",
-    "Read an Obsidian note by its path. Returns the full markdown content.",
-    { path: z.string().describe("Note path (e.g. 'Daily/2026-04-13.md')") },
-    async ({ path }) => {
-      try {
-        const text = await vault.readNote(path);
-        return { content: [{ type: "text", text }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
+  // Register each backend tool as a proxy
+  for (const tool of backendTools) {
+    // Build zod schema from JSON Schema input
+    const properties = tool.inputSchema?.properties || {};
+    const required = new Set(tool.inputSchema?.required || []);
+    const shape = {};
+
+    for (const [key, prop] of Object.entries(properties)) {
+      let schema;
+      if (prop.type === "number" || prop.type === "integer") {
+        schema = z.number();
+      } else if (prop.type === "boolean") {
+        schema = z.boolean();
+      } else {
+        schema = z.string();
       }
+      if (prop.description) schema = schema.describe(prop.description);
+      if (!required.has(key)) schema = schema.optional();
+      shape[key] = schema;
     }
-  );
 
-  // --- write_note ---
-  server.tool(
-    "write_note",
-    "Create or update an Obsidian note. LiveSync propagates to all devices.",
-    {
-      path: z.string().describe("Note path (e.g. 'Projects/idea.md')"),
-      content: z.string().describe("Full markdown content"),
-    },
-    async ({ path, content: noteContent }) => {
+    server.tool(tool.name, tool.description || tool.name, shape, async (args) => {
       try {
-        await vault.writeNote(path, noteContent);
-        return { content: [{ type: "text", text: `Written: ${path}` }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  // --- delete_note ---
-  server.tool(
-    "delete_note",
-    "Delete an Obsidian note from the vault.",
-    { path: z.string().describe("Note path to delete") },
-    async ({ path }) => {
-      try {
-        await vault.deleteNote(path);
-        return { content: [{ type: "text", text: `Deleted: ${path}` }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  // --- move_note ---
-  server.tool(
-    "move_note",
-    "Move or rename an Obsidian note.",
-    {
-      old_path: z.string().describe("Current path"),
-      new_path: z.string().describe("New path"),
-    },
-    async ({ old_path, new_path }) => {
-      try {
-        await vault.moveNote(old_path, new_path);
-        return { content: [{ type: "text", text: `Moved: ${old_path} → ${new_path}` }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  // --- list_notes ---
-  server.tool(
-    "list_notes",
-    "List notes in the vault. Optionally filter by folder prefix.",
-    {
-      folder: z.string().optional().describe("Folder prefix to filter (e.g. 'Projects/')"),
-      limit: z.number().optional().describe("Max results (default: 100)"),
-    },
-    async ({ folder, limit }) => {
-      try {
-        const maxResults = limit || 100;
-        let notes = await vault.listNotes();
-
-        if (folder) {
-          const folderLower = folder.toLowerCase();
-          notes = notes.filter((n) => n.path.toLowerCase().startsWith(folderLower));
+        const result = await backendMcpCall("tools/call", { name: tool.name, arguments: args });
+        if (result.result) return result.result;
+        if (result.error) {
+          return { content: [{ type: "text", text: `Backend error: ${result.error.message}` }], isError: true };
         }
-
-        const total = notes.length;
-        notes = notes.slice(0, maxResults);
-
-        const result = notes.map((n) => n.path).join("\n");
-        const summary = total > maxResults
-          ? `Showing ${maxResults} of ${total} notes:\n${result}`
-          : `${total} notes:\n${result}`;
-
-        return { content: [{ type: "text", text: summary }] };
+        return { content: [{ type: "text", text: JSON.stringify(result) }] };
       } catch (err) {
-        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
+        return { content: [{ type: "text", text: `Proxy error: ${err.message}` }], isError: true };
       }
-    }
-  );
-
-  // --- search_notes ---
-  server.tool(
-    "search_notes",
-    "Search Obsidian notes by content. Returns matching paths and excerpts.",
-    {
-      query: z.string().describe("Text to search for (case-insensitive)"),
-      folder: z.string().optional().describe("Restrict to folder prefix"),
-      limit: z.number().optional().describe("Max results (default: 20)"),
-    },
-    async ({ query, folder, limit }) => {
-      try {
-        const maxResults = limit || 20;
-        const queryLower = query.toLowerCase();
-        const allNotes = await vault.listNotes();
-
-        let notes = allNotes;
-        if (folder) {
-          const folderLower = folder.toLowerCase();
-          notes = notes.filter((n) => n.path.toLowerCase().startsWith(folderLower));
-        }
-
-        const matches = [];
-        for (const note of notes) {
-          if (matches.length >= maxResults) break;
-          try {
-            const content = await vault.readNote(note.path);
-            const idx = content.toLowerCase().indexOf(queryLower);
-            if (idx === -1) continue;
-
-            const start = Math.max(0, idx - 80);
-            const end = Math.min(content.length, idx + query.length + 80);
-            const excerpt = (start > 0 ? "..." : "") + content.slice(start, end) + (end < content.length ? "..." : "");
-            matches.push({ path: note.path, excerpt });
-          } catch { /* skip unreadable notes */ }
-        }
-
-        if (matches.length === 0) {
-          return { content: [{ type: "text", text: `No notes matching "${query}"` }] };
-        }
-
-        const result = matches.map((m) => `## ${m.path}\n${m.excerpt}`).join("\n\n");
-        return { content: [{ type: "text", text: `${matches.length} match(es):\n\n${result}` }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  // --- get_note_metadata ---
-  server.tool(
-    "get_note_metadata",
-    "Get metadata (timestamps, size) for a note without fetching content.",
-    { path: z.string().describe("Note path") },
-    async ({ path }) => {
-      try {
-        const meta = await vault.getMetadata(path);
-        const result = {
-          path: meta.path,
-          size: meta.size,
-          ctime: meta.ctime ? new Date(meta.ctime).toISOString() : null,
-          mtime: meta.mtime ? new Date(meta.mtime).toISOString() : null,
-        };
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  // --- recent_notes ---
-  server.tool(
-    "recent_notes",
-    "List recently modified notes, sorted by modification time (newest first).",
-    {
-      limit: z.number().optional().describe("Max results (default: 20)"),
-      folder: z.string().optional().describe("Restrict to folder prefix"),
-    },
-    async ({ limit, folder }) => {
-      try {
-        const maxResults = limit || 20;
-        let notes = await vault.listNotesWithMtime();
-
-        if (folder) {
-          const folderLower = folder.toLowerCase();
-          notes = notes.filter((n) => n.path.toLowerCase().startsWith(folderLower));
-        }
-
-        notes.sort((a, b) => b.mtime - a.mtime);
-        notes = notes.slice(0, maxResults);
-
-        const result = notes
-          .map((n) => `${new Date(n.mtime).toISOString().slice(0, 16)}  ${n.path}`)
-          .join("\n");
-
-        return { content: [{ type: "text", text: result || "No notes found" }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
-      }
-    }
-  );
+    });
+  }
 
   return server;
 }
@@ -418,9 +296,15 @@ app.use((req, _res, next) => {
   next();
 });
 
-// Health (unauthenticated)
-app.get("/health", (_, res) => {
-  res.json({ ok: true, version: "2.0.0" });
+// Health (unauthenticated) — also checks backend
+app.get("/health", async (_, res) => {
+  try {
+    const r = await fetch(`${BACKEND_URL}/health`);
+    const body = await r.json();
+    res.json({ ok: body.ok !== false, version: "2.0.0", backend: true });
+  } catch {
+    res.json({ ok: false, version: "2.0.0", backend: false });
+  }
 });
 
 // OAuth endpoints
@@ -439,7 +323,6 @@ const authMiddleware = async (req, res, next) => {
   console.log(`[auth] ${req.method} ${req.path} auth=${authHeader ? authHeader.slice(0, 20) + "..." : "none"}`);
 
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    console.log(`[auth] no bearer token, sending 401`);
     res.status(401).set("WWW-Authenticate", 'Bearer error="invalid_token"').json({ error: "Missing token" });
     return;
   }
@@ -447,11 +330,9 @@ const authMiddleware = async (req, res, next) => {
   const token = authHeader.slice(7);
   try {
     const authInfo = await provider.verifyAccessToken(token);
-    console.log(`[auth] accepted clientId=${authInfo.clientId}`);
     req.auth = authInfo;
     next();
   } catch (err) {
-    console.log(`[auth] rejected: ${err.message}`);
     res.status(401).set("WWW-Authenticate", `Bearer error="invalid_token"`).json({ error: err.message });
   }
 };
@@ -459,7 +340,6 @@ const authMiddleware = async (req, res, next) => {
 app.post("/mcp", authMiddleware, async (req, res) => {
   try {
     const sessionId = req.headers["mcp-session-id"];
-    console.log(`[mcp] POST session=${sessionId || "new"} body=${JSON.stringify(req.body).slice(0, 200)}`);
     if (sessionId && transports.has(sessionId)) {
       const transport = transports.get(sessionId);
       await transport.handleRequest(req, res, req.body);
@@ -475,11 +355,10 @@ app.post("/mcp", authMiddleware, async (req, res) => {
       await transport.handleRequest(req, res, req.body);
       if (transport.sessionId) {
         transports.set(transport.sessionId, transport);
-        console.log(`[mcp] new session: ${transport.sessionId}`);
       }
     }
   } catch (err) {
-    console.error(`[mcp] POST error: ${err.message}\n${err.stack}`);
+    console.error(`[mcp] POST error: ${err.message}`);
     if (!res.headersSent) res.status(500).json({ error: err.message });
   }
 });
@@ -504,9 +383,10 @@ app.delete("/mcp", authMiddleware, async (req, res) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`obsidian-couchdb-mcp v2.0.0 listening on :${PORT}`);
-  console.log(`Vault: ${COUCHDB_URL}/${COUCHDB_DATABASE}`);
+  console.log(`Backend: ${BACKEND_URL} (obsidian-sync-mcp)`);
   console.log(`OAuth issuer: ${SERVER_URL}`);
   console.log(`OAuth client_id: ${FIXED_CLIENT_ID}`);
   console.log(`OAuth client_secret: ${FIXED_CLIENT_SECRET}`);
   console.log(`MCP endpoint: ${SERVER_URL}/mcp (Streamable HTTP)`);
+  console.log(`Tools: ${backendTools.map((t) => t.name).join(", ")}`);
 });

@@ -2,36 +2,42 @@
 
 ## What is this?
 
-A self-hosted MCP server for reading and writing Obsidian notes via CouchDB (LiveSync). OAuth 2.1 wrapper around `obsidian-sync-mcp`'s vault backend, which uses `livesync-commonlib` for correct LiveSync format handling.
+OAuth 2.1 proxy for `obsidian-sync-mcp`. Adds Claude.ai connector compatibility (OAuth 2.1 + Streamable HTTP) to the obsidian-sync-mcp backend (which uses FastMCP with password auth, incompatible with Claude.ai connectors).
 
-Eight tools: `read_note`, `write_note`, `delete_note`, `move_note`, `list_notes`, `search_notes`, `get_note_metadata`, `recent_notes`.
-
-## Stack
-
-- `obsidian-sync-mcp` — LiveSync vault backend (livesync-commonlib, PouchDB, chunk handling, E2E encryption)
-- `@modelcontextprotocol/sdk` — MCP protocol, OAuth 2.1, Streamable HTTP transport
-- `express` — HTTP server
-- `zod` — schema validation
-
-## Project structure
-
-```
-server.js          — OAuth 2.1 provider + MCP tools (wrapping obsidian-sync-mcp Vault)
-package.json       — Dependencies
-Dockerfile         — Container build (Node 24 Alpine)
-k8s/               — Kubernetes manifests (template only, real secrets in K8sConfigs)
-.github/workflows/ — CI/CD to ghcr.io
-```
+Single container runs two processes: our OAuth proxy (:3000) and obsidian-sync-mcp backend (:8787).
 
 ## Architecture
 
 ```
 Claude.ai (OAuth 2.1 + Streamable HTTP)
-  → server.js (OAuth provider + MCP SDK)
-    → obsidian-sync-mcp Vault class
-      → livesync-commonlib (chunks, encryption, format)
-        → CouchDB (LiveSync replication)
-          → Obsidian Desktop/Mobile
+  → server.js :3000 (OAuth provider + MCP SDK, tool proxy)
+    → obsidian-sync-mcp :8787 (FastMCP + livesync-commonlib)
+      → CouchDB (LiveSync replication)
+        → Obsidian Desktop/Mobile
+```
+
+## How it works
+
+1. server.js spawns obsidian-sync-mcp as child process on port 8787
+2. On startup, discovers available tools via MCP tools/list call to backend
+3. Registers each tool as a proxy in our MCP server
+4. Claude.ai authenticates via OAuth 2.1 → calls our /mcp → we proxy to backend
+
+## Stack
+
+- `obsidian-sync-mcp` — LiveSync vault backend (livesync-commonlib, PouchDB, chunks, encryption, soft-deletes)
+- `@modelcontextprotocol/sdk` — MCP protocol, OAuth 2.1, Streamable HTTP transport
+- `express` + `zod` — HTTP server + schema validation
+
+## Project structure
+
+```
+server.js          — OAuth 2.1 provider + tool proxy to backend
+postinstall.js     — Patches obsidian-sync-mcp PouchDB adapter bug
+package.json       — Dependencies
+Dockerfile         — Single container (both processes)
+k8s/               — Kubernetes deployment template
+.github/workflows/ — CI/CD to ghcr.io
 ```
 
 ## Running locally
@@ -39,30 +45,15 @@ Claude.ai (OAuth 2.1 + Streamable HTTP)
 ```bash
 npm install
 COUCHDB_URL=http://localhost:5984 COUCHDB_DATABASE=obsidian \
-COUCHDB_USERNAME=user COUCHDB_PASSWORD=pass MCP_SECRET=secret \
+COUCHDB_USER=user COUCHDB_PASSWORD=pass MCP_SECRET=secret \
 SERVER_URL=http://localhost:3000 node server.js
 ```
 
 ## Key design decisions
 
-- **OAuth 2.1 wrapper** — obsidian-sync-mcp uses FastMCP with password auth, incompatible with Claude.ai connectors. We wrap their Vault backend with our OAuth 2.1 (same pattern as telegram-bot-mcp).
-- **livesync-commonlib** — All CouchDB document handling (chunks, soft-deletes, encryption, path normalization) delegated to the official library. No manual format implementation.
-- **Node 24** — Required by obsidian-sync-mcp/livesync-commonlib.
-- **Internal import** — `obsidian-sync-mcp/dist/vault-*.js` is imported directly since the package doesn't export the Vault class publicly.
-
-## Common tasks
-
-### Add a new tool
-Add another `server.tool()` call in `createMcpServer()`, using `vault.*` methods.
-
-### Change OAuth token expiry
-In `OAuthProvider.exchangeAuthorizationCode()`, change `expiresIn` (default: 86400 = 24h).
-
-### Test locally
-```bash
-curl http://localhost:3000/health
-curl http://localhost:3000/.well-known/oauth-authorization-server
-```
+- **Proxy, not import** — obsidian-sync-mcp is designed as a CLI, not a library. Running it as a child process avoids PouchDB adapter conflicts and livesync-commonlib browser polyfill issues.
+- **Dynamic tool discovery** — Tools are discovered from backend at startup via tools/list, not hardcoded. New tools from obsidian-sync-mcp updates appear automatically.
+- **postinstall patch** — obsidian-sync-mcp has a bug where PouchDB is created without `adapter: "http"`. The patch adds it.
 
 ## CI/CD
 
