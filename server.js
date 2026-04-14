@@ -8,6 +8,17 @@ import { z } from "zod";
 // Polyfills required by livesync-commonlib (browser globals)
 if (!("navigator" in globalThis)) globalThis.navigator = { language: "en" };
 
+// The vault's internal change watcher throws unhandled errors in headless mode.
+// Catch them to prevent process crash — the core read/write APIs still work.
+process.on("uncaughtException", (err) => {
+  if (err.message?.includes("Only absolute URLs") || err.message?.includes("watching changes")) {
+    console.log(`[vault] suppressed watcher error: ${err.message}`);
+    return;
+  }
+  console.error("[fatal]", err);
+  process.exit(1);
+});
+
 // --- Configuration ---
 
 const COUCHDB_URL = process.env.COUCHDB_URL;
