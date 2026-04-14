@@ -358,14 +358,14 @@ function createMcpServer() {
         const mdOnly = markdown_only !== false;
         const maxResults = limit || 100;
 
-        const { body } = await couchFetch("/_all_docs?include_docs=false");
+        const { body } = await couchFetch("/_all_docs?include_docs=true");
         if (!body.rows) {
           return { content: [{ type: "text", text: "No documents found" }] };
         }
 
         let notes = body.rows
-          .map((r) => r.id)
-          .filter(isNote);
+          .filter((r) => isNote(r.id) && !r.doc?.deleted)
+          .map((r) => r.id);
 
         if (mdOnly) notes = notes.filter(isMarkdown);
         if (folder) notes = notes.filter((id) => id.startsWith(folder));
@@ -408,7 +408,7 @@ function createMcpServer() {
         const matches = [];
         for (const row of body.rows) {
           if (matches.length >= maxResults) break;
-          if (!row.doc || !isNote(row.id) || !isMarkdown(row.id)) continue;
+          if (!row.doc || !isNote(row.id) || !isMarkdown(row.id) || row.doc.deleted) continue;
           if (folder && !row.id.startsWith(folder)) continue;
 
           // For plain docs, search data directly
@@ -517,19 +517,33 @@ function createMcpServer() {
           return { content: [{ type: "text", text: `Note not found: ${path}` }], isError: true };
         }
 
-        // Only delete the metadata doc — chunks are immutable and shared.
-        // LiveSync handles chunk garbage collection.
-        const { body: delBody } = await couchFetch(
-          `/${encodeURIComponent(body._id)}?rev=${body._rev}`,
-          { method: "DELETE" }
-        );
+        // LiveSync deletes by updating the doc with deleted: true, not CouchDB DELETE.
+        // This allows the delete to propagate to all devices via replication.
+        const now = Date.now();
+        const delDoc = {
+          _id: body._id,
+          _rev: body._rev,
+          path: body.path,
+          ctime: body.ctime,
+          mtime: now,
+          size: 0,
+          type: body.type || "plain",
+          children: [],
+          eden: {},
+          deleted: true,
+        };
 
-        if (delBody.ok) {
+        const { body: putBody } = await couchFetch(`/${encodeURIComponent(body._id)}`, {
+          method: "PUT",
+          body: JSON.stringify(delDoc),
+        });
+
+        if (putBody.ok) {
           return { content: [{ type: "text", text: `Deleted: ${path}` }] };
         }
 
         return {
-          content: [{ type: "text", text: `CouchDB error: ${JSON.stringify(delBody)}` }],
+          content: [{ type: "text", text: `CouchDB error: ${JSON.stringify(putBody)}` }],
           isError: true,
         };
       } catch (err) {
@@ -587,7 +601,7 @@ function createMcpServer() {
         }
 
         let notes = body.rows
-          .filter((r) => r.doc && isNote(r.id) && isMarkdown(r.id))
+          .filter((r) => r.doc && isNote(r.id) && isMarkdown(r.id) && !r.doc.deleted)
           .map((r) => ({ path: r.id, mtime: r.doc.mtime || 0 }));
 
         if (folder) notes = notes.filter((n) => n.path.startsWith(folder));
