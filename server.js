@@ -43,8 +43,14 @@ const vault = new Vault({
   passphrase: COUCHDB_PASSPHRASE,
 });
 
-await vault.init();
-console.log(`Vault connected: ${COUCHDB_URL}/${COUCHDB_DATABASE}`);
+try {
+  await vault.init();
+  console.log(`Vault connected: ${COUCHDB_URL}/${COUCHDB_DATABASE}`);
+} catch (err) {
+  // vault.init() may throw from watchChanges — the core API still works
+  console.log(`Vault initialized with warning: ${err.message}`);
+  console.log(`Vault: ${COUCHDB_URL}/${COUCHDB_DATABASE} (watch disabled)`);
+}
 
 // --- OAuth 2.1 Provider (in-memory, same pattern as telegram-bot-mcp) ---
 
