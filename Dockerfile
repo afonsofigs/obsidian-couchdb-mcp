@@ -5,7 +5,7 @@ WORKDIR /app
 COPY package.json postinstall.js ./
 RUN npm install --omit=dev
 
-COPY server.js ./
+COPY server.js backend-wrapper.js ./
 
 USER 1000
 EXPOSE 3000

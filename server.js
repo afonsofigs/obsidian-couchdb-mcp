@@ -21,7 +21,7 @@ if (!MCP_SECRET) {
 
 // --- Start obsidian-sync-mcp backend ---
 
-const backend = spawn("node", ["node_modules/obsidian-sync-mcp/dist/main.js"], {
+const backend = spawn("node", ["backend-wrapper.js"], {
   stdio: ["ignore", "pipe", "pipe"],
   env: { ...process.env, PORT: String(BACKEND_PORT) },
 });
