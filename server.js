@@ -69,7 +69,7 @@ async function backendMcpCall(method, params = {}) {
     }),
   });
 
-  const initText = await initRes.text();
+  await initRes.text();
   const sessionId = initRes.headers.get("mcp-session-id");
 
   // Send initialized notification

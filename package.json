@@ -1,7 +1,7 @@
 {
   "name": "obsidian-couchdb-mcp",
-  "version": "1.0.0",
-  "description": "Self-hosted MCP server for reading and writing Obsidian notes via CouchDB (LiveSync)",
+  "version": "2.0.0",
+  "description": "OAuth 2.1 proxy for obsidian-sync-mcp — Claude.ai connector for Obsidian via CouchDB (LiveSync)",
   "type": "module",
   "main": "server.js",
   "scripts": {
