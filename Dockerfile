@@ -2,7 +2,7 @@ FROM node:24-alpine
 
 WORKDIR /app
 
-COPY package.json ./
+COPY package.json postinstall.js ./
 RUN npm install --omit=dev
 
 COPY server.js ./

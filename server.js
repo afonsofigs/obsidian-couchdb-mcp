@@ -30,14 +30,8 @@ if (!MCP_SECRET) {
 
 // --- Vault backend (obsidian-sync-mcp + livesync-commonlib) ---
 
-// Pre-register PouchDB adapter before importing Vault
-// The bundled vault module imports pouchdb-adapter-http but the adapter
-// registration can fail in some Node/npm hoisting scenarios.
-import PouchDB from "pouchdb-core";
-import HttpPouch from "pouchdb-adapter-http";
-PouchDB.plugin(HttpPouch);
-
 // Import Vault from obsidian-sync-mcp's compiled output
+// The postinstall script patches the bundle to include adapter: "http"
 // This handles all LiveSync format details: chunks, encryption, soft-deletes, etc.
 const { Vault } = await import("obsidian-sync-mcp/dist/vault-5Y35MEZS.js");
 
