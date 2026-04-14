@@ -5,12 +5,16 @@ import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import express from "express";
 import { z } from "zod";
 
+// Polyfills required by livesync-commonlib (browser globals)
+if (!("navigator" in globalThis)) globalThis.navigator = { language: "en" };
+
 // --- Configuration ---
 
 const COUCHDB_URL = process.env.COUCHDB_URL;
 const COUCHDB_DATABASE = process.env.COUCHDB_DATABASE || "obsidian";
 const COUCHDB_USER = process.env.COUCHDB_USERNAME || process.env.COUCHDB_USER || "";
 const COUCHDB_PASSWORD = process.env.COUCHDB_PASSWORD || "";
+const COUCHDB_PASSPHRASE = process.env.COUCHDB_PASSPHRASE || undefined;
 const MCP_SECRET = process.env.MCP_SECRET;
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const SERVER_URL = process.env.SERVER_URL || `http://localhost:${PORT}`;
@@ -24,165 +28,22 @@ if (!MCP_SECRET) {
   process.exit(1);
 }
 
-// --- CouchDB Client (native fetch) ---
+// --- Vault backend (obsidian-sync-mcp + livesync-commonlib) ---
 
-const couchBaseUrl = `${COUCHDB_URL}/${encodeURIComponent(COUCHDB_DATABASE)}`;
-const couchHeaders = { "Content-Type": "application/json" };
+// Import Vault from obsidian-sync-mcp's compiled output
+// This handles all LiveSync format details: chunks, encryption, soft-deletes, etc.
+const { Vault } = await import("obsidian-sync-mcp/dist/vault-5Y35MEZS.js");
 
-if (COUCHDB_USER) {
-  couchHeaders["Authorization"] =
-    "Basic " + Buffer.from(`${COUCHDB_USER}:${COUCHDB_PASSWORD}`).toString("base64");
-}
+const vault = new Vault({
+  url: COUCHDB_URL,
+  username: COUCHDB_USER,
+  password: COUCHDB_PASSWORD,
+  database: COUCHDB_DATABASE,
+  passphrase: COUCHDB_PASSPHRASE,
+});
 
-async function couchFetch(path, options = {}) {
-  const url = path.startsWith("http") ? path : `${couchBaseUrl}${path}`;
-  const res = await fetch(url, {
-    ...options,
-    headers: { ...couchHeaders, ...options.headers },
-  });
-  const body = await res.json();
-  if (!res.ok && res.status !== 404) {
-    throw new Error(`CouchDB ${res.status}: ${JSON.stringify(body)}`);
-  }
-  return { status: res.status, body };
-}
-
-// --- LiveSync Document Helpers ---
-
-// LiveSync document types:
-//   "plain"   — metadata doc, content inline in `data` field
-//   "newnote" — metadata doc, content split across chunk docs referenced by `children`
-//   "leaf"    — chunk doc containing a `data` fragment (type "leaf", id is content hash)
-// Special fields:
-//   `eden`     — Record<string, EdenChunk> for inline chunks (newer format)
-//   `path`     — FilePathWithPrefix (may differ from _id in obfuscation/case-insensitive mode)
-//   `children` — array of chunk document IDs
-// Fixed IDs to ignore: "obsydian_livesync_version", "syncinfo"
-
-async function readNoteContent(doc) {
-  // If doc has children, content is in chunks — regardless of type field
-  const hasChildren = Array.isArray(doc.children) && doc.children.length > 0;
-
-  if (!hasChildren) {
-    // No chunks: content is inline in data field
-    return doc.data || "";
-  }
-
-  // Check eden (inline chunks embedded in the doc itself) first
-  if (doc.eden && Object.keys(doc.eden).length > 0) {
-    const edenChunks = [];
-    for (const childId of doc.children) {
-      if (doc.eden[childId]) {
-        edenChunks.push(doc.eden[childId].data || "");
-      } else {
-        // Fall back to fetching from CouchDB
-        const { status, body } = await couchFetch(`/${encodeURIComponent(childId)}`);
-        edenChunks.push(status === 404 ? "[missing chunk]" : body.data || "");
-      }
-    }
-    return edenChunks.join("");
-  }
-
-  // Reassemble from children chunk documents in CouchDB
-  const chunks = [];
-  for (const childId of doc.children) {
-    const { status, body } = await couchFetch(`/${encodeURIComponent(childId)}`);
-    if (status === 404) {
-      chunks.push("[missing chunk]");
-    } else {
-      chunks.push(body.data || "");
-    }
-  }
-  return chunks.join("");
-}
-
-// Create leaf chunk documents in CouchDB for note content.
-// LiveSync ALWAYS stores content in chunks — the metadata doc's `data` field must be empty.
-// Returns array of chunk document IDs.
-async function writeChunks(content) {
-  // Split into ~250KB chunks (CouchDB max_document_size is typically 50MB, but smaller is better for sync)
-  const CHUNK_SIZE = 250_000;
-  const chunkIds = [];
-
-  for (let i = 0; i < content.length; i += CHUNK_SIZE) {
-    const chunkData = content.slice(i, i + CHUNK_SIZE);
-    // Generate chunk ID using content hash (same as LiveSync: h: prefix + hash)
-    const hash = createHash("sha1").update(chunkData).digest("hex").slice(0, 12);
-    const chunkId = `h:${hash}${i.toString(36)}`;
-
-    // Check if chunk already exists (content-addressable)
-    const { status } = await couchFetch(`/${encodeURIComponent(chunkId)}`);
-    if (status !== 200) {
-      await couchFetch(`/${encodeURIComponent(chunkId)}`, {
-        method: "PUT",
-        body: JSON.stringify({
-          _id: chunkId,
-          data: chunkData,
-          type: "leaf",
-        }),
-      });
-    }
-    chunkIds.push(chunkId);
-  }
-
-  return chunkIds;
-}
-
-// Sanitize a path for use as CouchDB _id: lowercase, no accents.
-// LiveSync case-insensitive mode requires lowercase _id.
-// Accented characters in filenames can cause filesystem issues when LiveSync creates files.
-function sanitizePath(path) {
-  return path
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, ""); // strip combining diacritical marks
-}
-
-// Resolve a note path to its CouchDB document.
-// LiveSync case-insensitive mode stores _id in lowercase but path in original case.
-// Try exact _id first, then fall back to lowercase _id.
-async function resolveNote(path) {
-  // Try exact path first
-  const { status, body } = await couchFetch(`/${encodeURIComponent(path)}`);
-  if (status === 200) return { status, body };
-
-  // Try sanitized (lowercase + no accents)
-  const sanitized = sanitizePath(path);
-  if (sanitized !== path) {
-    const { status: s2, body: b2 } = await couchFetch(`/${encodeURIComponent(sanitized)}`);
-    if (s2 === 200) return { status: s2, body: b2 };
-  }
-
-  // Try just lowercase (for docs with accents in _id)
-  const lower = path.toLowerCase();
-  if (lower !== path && lower !== sanitized) {
-    const { status: s3, body: b3 } = await couchFetch(`/${encodeURIComponent(lower)}`);
-    if (s3 === 200) return { status: s3, body: b3 };
-  }
-
-  return { status: 404, body: null };
-}
-
-// LiveSync internal doc IDs to exclude from note listings
-const INTERNAL_IDS = new Set([
-  "obsydian_livesync_version",
-  "syncinfo",
-]);
-
-function isNote(docId) {
-  if (docId.startsWith("_")) return false;       // CouchDB system docs (_design, _local)
-  if (docId.startsWith("h:")) return false;       // Chunk/leaf documents
-  if (docId.startsWith("ps:")) return false;      // Plugin settings sync
-  if (docId.startsWith("ix:")) return false;      // Index documents
-  if (docId.startsWith("cc:")) return false;      // Conflict check docs
-  if (docId.startsWith("f:")) return false;       // Obfuscated path docs (avoid duplicates)
-  if (INTERNAL_IDS.has(docId)) return false;      // Fixed internal docs
-  return true;
-}
-
-function isMarkdown(docId) {
-  return docId.endsWith(".md");
-}
+await vault.init();
+console.log(`Vault connected: ${COUCHDB_URL}/${COUCHDB_DATABASE}`);
 
 // --- OAuth 2.1 Provider (in-memory, same pattern as telegram-bot-mcp) ---
 
@@ -318,126 +179,22 @@ class OAuthProvider {
   }
 }
 
-// --- MCP Server (Obsidian CouchDB tools) ---
+// --- MCP Server (tools powered by Vault backend) ---
 
 function createMcpServer() {
-  const server = new McpServer({ name: "obsidian-couchdb-mcp", version: "1.0.0" });
+  const server = new McpServer({ name: "obsidian-couchdb-mcp", version: "2.0.0" });
 
   // --- read_note ---
   server.tool(
     "read_note",
     "Read an Obsidian note by its path. Returns the full markdown content.",
-    {
-      path: z.string().describe("Note path relative to vault root (e.g. 'Daily/2026-04-13.md')"),
-    },
+    { path: z.string().describe("Note path (e.g. 'Daily/2026-04-13.md')") },
     async ({ path }) => {
       try {
-        const { status, body } = await resolveNote(path);
-        if (status === 404) {
-          return { content: [{ type: "text", text: `Note not found: ${path}` }], isError: true };
-        }
-        const text = await readNoteContent(body);
+        const text = await vault.readNote(path);
         return { content: [{ type: "text", text }] };
       } catch (err) {
-        return { content: [{ type: "text", text: `Error reading note: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  // --- list_notes ---
-  server.tool(
-    "list_notes",
-    "List notes in the Obsidian vault. Optionally filter by folder prefix or extension.",
-    {
-      folder: z.string().optional().describe("Folder prefix to filter (e.g. 'Projects/'). Lists all if omitted."),
-      markdown_only: z.boolean().optional().describe("Only list .md files (default: true)"),
-      limit: z.number().optional().describe("Max results (default: 100)"),
-    },
-    async ({ folder, markdown_only, limit }) => {
-      try {
-        const mdOnly = markdown_only !== false;
-        const maxResults = limit || 100;
-
-        const { body } = await couchFetch("/_all_docs?include_docs=true");
-        if (!body.rows) {
-          return { content: [{ type: "text", text: "No documents found" }] };
-        }
-
-        let notes = body.rows
-          .filter((r) => isNote(r.id) && !r.doc?.deleted)
-          .map((r) => r.id);
-
-        if (mdOnly) notes = notes.filter(isMarkdown);
-        if (folder) notes = notes.filter((id) => id.startsWith(folder));
-
-        const total = notes.length;
-        notes = notes.slice(0, maxResults);
-
-        const result = notes.join("\n");
-        const summary = total > maxResults
-          ? `Showing ${maxResults} of ${total} notes:\n${result}`
-          : `${total} notes:\n${result}`;
-
-        return { content: [{ type: "text", text: summary }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `Error listing notes: ${err.message}` }], isError: true };
-      }
-    }
-  );
-
-  // --- search_notes ---
-  server.tool(
-    "search_notes",
-    "Search Obsidian notes by content. Returns matching note paths and excerpts.",
-    {
-      query: z.string().describe("Text to search for (case-insensitive)"),
-      folder: z.string().optional().describe("Restrict search to this folder prefix"),
-      limit: z.number().optional().describe("Max results (default: 20)"),
-    },
-    async ({ query, folder, limit }) => {
-      try {
-        const maxResults = limit || 20;
-        const queryLower = query.toLowerCase();
-
-        // Get all note docs (include_docs=true so we can search content)
-        const { body } = await couchFetch("/_all_docs?include_docs=true");
-        if (!body.rows) {
-          return { content: [{ type: "text", text: "No documents found" }] };
-        }
-
-        const matches = [];
-        for (const row of body.rows) {
-          if (matches.length >= maxResults) break;
-          if (!row.doc || !isNote(row.id) || !isMarkdown(row.id) || row.doc.deleted) continue;
-          if (folder && !row.id.startsWith(folder)) continue;
-
-          // For plain docs, search data directly
-          // For newnote, we only search if data is available (avoid fetching all chunks)
-          const data = row.doc.data || "";
-          if (!data) continue;
-
-          const idx = data.toLowerCase().indexOf(queryLower);
-          if (idx === -1) continue;
-
-          // Extract excerpt around match
-          const start = Math.max(0, idx - 80);
-          const end = Math.min(data.length, idx + query.length + 80);
-          const excerpt = (start > 0 ? "..." : "") + data.slice(start, end) + (end < data.length ? "..." : "");
-
-          matches.push({ path: row.doc.path || row.id, excerpt });
-        }
-
-        if (matches.length === 0) {
-          return { content: [{ type: "text", text: `No notes matching "${query}"` }] };
-        }
-
-        const result = matches
-          .map((m) => `## ${m.path}\n${m.excerpt}`)
-          .join("\n\n");
-
-        return { content: [{ type: "text", text: `${matches.length} match(es):\n\n${result}` }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `Error searching: ${err.message}` }], isError: true };
+        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
       }
     }
   );
@@ -445,60 +202,17 @@ function createMcpServer() {
   // --- write_note ---
   server.tool(
     "write_note",
-    "Create or update an Obsidian note. Writes directly to CouchDB — LiveSync propagates to devices.",
+    "Create or update an Obsidian note. LiveSync propagates to all devices.",
     {
-      path: z.string().describe("Note path relative to vault root (e.g. 'Projects/idea.md')"),
-      content: z.string().describe("Full markdown content for the note"),
+      path: z.string().describe("Note path (e.g. 'Projects/idea.md')"),
+      content: z.string().describe("Full markdown content"),
     },
     async ({ path, content: noteContent }) => {
       try {
-        const now = Date.now();
-
-        // Strip accents from path (accented filenames cause sync issues)
-        // Keep casing for path field, lowercase for _id
-        const stripAccents = (s) => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-        const safePath = stripAccents(path);
-
-        // Check if doc already exists (need _rev for update)
-        const { status, body: existing } = await resolveNote(path);
-        const docId = (status === 200 && existing._id) ? existing._id : sanitizePath(path);
-
-        // LiveSync requires content in chunk documents — metadata data field must be empty
-        const children = await writeChunks(noteContent);
-
-        // LiveSync MetadataDocument format
-        const doc = {
-          _id: docId,
-          path: safePath,
-          data: "",
-          ctime: existing?.ctime || now,
-          mtime: now,
-          size: Buffer.byteLength(noteContent, "utf-8"),
-          type: "plain",
-          children: children,
-          eden: {},
-        };
-
-        if (status === 200 && existing._rev) {
-          doc._rev = existing._rev;
-        }
-
-        const { status: putStatus, body: putBody } = await couchFetch(`/${encodeURIComponent(docId)}`, {
-          method: "PUT",
-          body: JSON.stringify(doc),
-        });
-
-        if (putBody.ok) {
-          const action = status === 200 ? "Updated" : "Created";
-          return { content: [{ type: "text", text: `${action}: ${path} (rev: ${putBody.rev})` }] };
-        }
-
-        return {
-          content: [{ type: "text", text: `CouchDB error: ${JSON.stringify(putBody)}` }],
-          isError: true,
-        };
+        await vault.writeNote(path, noteContent);
+        return { content: [{ type: "text", text: `Written: ${path}` }] };
       } catch (err) {
-        return { content: [{ type: "text", text: `Error writing note: ${err.message}` }], isError: true };
+        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
       }
     }
   );
@@ -507,47 +221,112 @@ function createMcpServer() {
   server.tool(
     "delete_note",
     "Delete an Obsidian note from the vault.",
-    {
-      path: z.string().describe("Note path to delete (e.g. 'Scratch/temp.md')"),
-    },
+    { path: z.string().describe("Note path to delete") },
     async ({ path }) => {
       try {
-        const { status, body } = await resolveNote(path);
-        if (status === 404) {
-          return { content: [{ type: "text", text: `Note not found: ${path}` }], isError: true };
-        }
-
-        // LiveSync deletes by updating the doc with deleted: true, not CouchDB DELETE.
-        // This allows the delete to propagate to all devices via replication.
-        const now = Date.now();
-        const delDoc = {
-          _id: body._id,
-          _rev: body._rev,
-          path: body.path,
-          ctime: body.ctime,
-          mtime: now,
-          size: 0,
-          type: body.type || "plain",
-          children: [],
-          eden: {},
-          deleted: true,
-        };
-
-        const { body: putBody } = await couchFetch(`/${encodeURIComponent(body._id)}`, {
-          method: "PUT",
-          body: JSON.stringify(delDoc),
-        });
-
-        if (putBody.ok) {
-          return { content: [{ type: "text", text: `Deleted: ${path}` }] };
-        }
-
-        return {
-          content: [{ type: "text", text: `CouchDB error: ${JSON.stringify(putBody)}` }],
-          isError: true,
-        };
+        await vault.deleteNote(path);
+        return { content: [{ type: "text", text: `Deleted: ${path}` }] };
       } catch (err) {
-        return { content: [{ type: "text", text: `Error deleting note: ${err.message}` }], isError: true };
+        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
+      }
+    }
+  );
+
+  // --- move_note ---
+  server.tool(
+    "move_note",
+    "Move or rename an Obsidian note.",
+    {
+      old_path: z.string().describe("Current path"),
+      new_path: z.string().describe("New path"),
+    },
+    async ({ old_path, new_path }) => {
+      try {
+        await vault.moveNote(old_path, new_path);
+        return { content: [{ type: "text", text: `Moved: ${old_path} → ${new_path}` }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
+      }
+    }
+  );
+
+  // --- list_notes ---
+  server.tool(
+    "list_notes",
+    "List notes in the vault. Optionally filter by folder prefix.",
+    {
+      folder: z.string().optional().describe("Folder prefix to filter (e.g. 'Projects/')"),
+      limit: z.number().optional().describe("Max results (default: 100)"),
+    },
+    async ({ folder, limit }) => {
+      try {
+        const maxResults = limit || 100;
+        let notes = await vault.listNotes();
+
+        if (folder) {
+          const folderLower = folder.toLowerCase();
+          notes = notes.filter((n) => n.path.toLowerCase().startsWith(folderLower));
+        }
+
+        const total = notes.length;
+        notes = notes.slice(0, maxResults);
+
+        const result = notes.map((n) => n.path).join("\n");
+        const summary = total > maxResults
+          ? `Showing ${maxResults} of ${total} notes:\n${result}`
+          : `${total} notes:\n${result}`;
+
+        return { content: [{ type: "text", text: summary }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
+      }
+    }
+  );
+
+  // --- search_notes ---
+  server.tool(
+    "search_notes",
+    "Search Obsidian notes by content. Returns matching paths and excerpts.",
+    {
+      query: z.string().describe("Text to search for (case-insensitive)"),
+      folder: z.string().optional().describe("Restrict to folder prefix"),
+      limit: z.number().optional().describe("Max results (default: 20)"),
+    },
+    async ({ query, folder, limit }) => {
+      try {
+        const maxResults = limit || 20;
+        const queryLower = query.toLowerCase();
+        const allNotes = await vault.listNotes();
+
+        let notes = allNotes;
+        if (folder) {
+          const folderLower = folder.toLowerCase();
+          notes = notes.filter((n) => n.path.toLowerCase().startsWith(folderLower));
+        }
+
+        const matches = [];
+        for (const note of notes) {
+          if (matches.length >= maxResults) break;
+          try {
+            const content = await vault.readNote(note.path);
+            const idx = content.toLowerCase().indexOf(queryLower);
+            if (idx === -1) continue;
+
+            const start = Math.max(0, idx - 80);
+            const end = Math.min(content.length, idx + query.length + 80);
+            const excerpt = (start > 0 ? "..." : "") + content.slice(start, end) + (end < content.length ? "..." : "");
+            matches.push({ path: note.path, excerpt });
+          } catch { /* skip unreadable notes */ }
+        }
+
+        if (matches.length === 0) {
+          return { content: [{ type: "text", text: `No notes matching "${query}"` }] };
+        }
+
+        const result = matches.map((m) => `## ${m.path}\n${m.excerpt}`).join("\n\n");
+        return { content: [{ type: "text", text: `${matches.length} match(es):\n\n${result}` }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
       }
     }
   );
@@ -555,28 +334,18 @@ function createMcpServer() {
   // --- get_note_metadata ---
   server.tool(
     "get_note_metadata",
-    "Get metadata (timestamps, size, type) for a note without fetching its full content.",
-    {
-      path: z.string().describe("Note path relative to vault root"),
-    },
+    "Get metadata (timestamps, size) for a note without fetching content.",
+    { path: z.string().describe("Note path") },
     async ({ path }) => {
       try {
-        const { status, body } = await resolveNote(path);
-        if (status === 404) {
-          return { content: [{ type: "text", text: `Note not found: ${path}` }], isError: true };
-        }
-        const meta = {
-          id: body._id,
-          path: body.path || body._id,
-          rev: body._rev,
-          type: body.type || "plain",
-          size: body.size || 0,
-          ctime: body.ctime ? new Date(body.ctime).toISOString() : null,
-          mtime: body.mtime ? new Date(body.mtime).toISOString() : null,
-          children: body.children ? body.children.length : 0,
-          deleted: body.deleted || false,
+        const meta = await vault.getMetadata(path);
+        const result = {
+          path: meta.path,
+          size: meta.size,
+          ctime: meta.ctime ? new Date(meta.ctime).toISOString() : null,
+          mtime: meta.mtime ? new Date(meta.mtime).toISOString() : null,
         };
-        return { content: [{ type: "text", text: JSON.stringify(meta, null, 2) }] };
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       } catch (err) {
         return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
       }
@@ -589,22 +358,17 @@ function createMcpServer() {
     "List recently modified notes, sorted by modification time (newest first).",
     {
       limit: z.number().optional().describe("Max results (default: 20)"),
-      folder: z.string().optional().describe("Restrict to this folder prefix"),
+      folder: z.string().optional().describe("Restrict to folder prefix"),
     },
     async ({ limit, folder }) => {
       try {
         const maxResults = limit || 20;
+        let notes = await vault.listNotesWithMtime();
 
-        const { body } = await couchFetch("/_all_docs?include_docs=true");
-        if (!body.rows) {
-          return { content: [{ type: "text", text: "No documents found" }] };
+        if (folder) {
+          const folderLower = folder.toLowerCase();
+          notes = notes.filter((n) => n.path.toLowerCase().startsWith(folderLower));
         }
-
-        let notes = body.rows
-          .filter((r) => r.doc && isNote(r.id) && isMarkdown(r.id) && !r.doc.deleted)
-          .map((r) => ({ path: r.id, mtime: r.doc.mtime || 0 }));
-
-        if (folder) notes = notes.filter((n) => n.path.startsWith(folder));
 
         notes.sort((a, b) => b.mtime - a.mtime);
         notes = notes.slice(0, maxResults);
@@ -637,13 +401,8 @@ app.use((req, _res, next) => {
 });
 
 // Health (unauthenticated)
-app.get("/health", async (_, res) => {
-  try {
-    const { status } = await couchFetch("/");
-    res.json({ ok: status === 200, version: "1.0.0", couchdb: status === 200 });
-  } catch {
-    res.json({ ok: false, version: "1.0.0", couchdb: false });
-  }
+app.get("/health", (_, res) => {
+  res.json({ ok: true, version: "2.0.0" });
 });
 
 // OAuth endpoints
@@ -726,8 +485,8 @@ app.delete("/mcp", authMiddleware, async (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`obsidian-couchdb-mcp listening on :${PORT}`);
-  console.log(`CouchDB: ${COUCHDB_URL}/${COUCHDB_DATABASE}`);
+  console.log(`obsidian-couchdb-mcp v2.0.0 listening on :${PORT}`);
+  console.log(`Vault: ${COUCHDB_URL}/${COUCHDB_DATABASE}`);
   console.log(`OAuth issuer: ${SERVER_URL}`);
   console.log(`OAuth client_id: ${FIXED_CLIENT_ID}`);
   console.log(`OAuth client_secret: ${FIXED_CLIENT_SECRET}`);
