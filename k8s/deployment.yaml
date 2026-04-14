@@ -43,7 +43,7 @@ spec:
                   name: obsidian-mcp-secrets
                   key: MCP_SECRET
             - name: SERVER_URL
-              value: "https://obsidian-mcp.boathouse.group"
+              value: "https://obsidian-mcp.example.com"
           resources:
             requests:
               cpu: 10m
