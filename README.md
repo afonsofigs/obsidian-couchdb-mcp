@@ -8,6 +8,7 @@ OAuth 2.1 proxy for [obsidian-sync-mcp](https://github.com/es617/obsidian-sync-m
 
 - **All obsidian-sync-mcp tools**: `read_note`, `write_note`, `edit_note`, `delete_note`, `move_note`, `list_notes`, `list_folders`, `list_tags`, `get_note_metadata`
 - **OAuth 2.1**: Fixed client credentials — works with Claude.ai connectors and scheduled tasks
+- **Persistent OAuth tokens**: Issued tokens are written to disk so they survive container/pod restarts (no re-auth in Claude.ai after redeploys)
 - **Dynamic tool discovery**: New tools from obsidian-sync-mcp updates appear automatically
 - **LiveSync compatible**: Powered by [livesync-commonlib](https://github.com/vrtmrz/livesync-commonlib) (chunks, encryption, soft-deletes)
 - **Single Docker image**: Both OAuth proxy and backend in one container
@@ -50,6 +51,7 @@ MCP_SECRET=your_secret SERVER_URL=http://localhost:3000 node server.js
 | `COUCHDB_PASSWORD` | No | CouchDB password |
 | `COUCHDB_PASSPHRASE` | No | LiveSync E2E encryption passphrase |
 | `SERVER_URL` | Yes | Public HTTPS URL (OAuth issuer) |
+| `TOKEN_STORE_PATH` | No | Path for persisted OAuth tokens (default: `/data/oauth-tokens.json`). Mount a writable volume at this directory to survive restarts. |
 | `PORT` | No | OAuth proxy port (default: 3000) |
 | `BACKEND_PORT` | No | Backend port (default: 8787) |
 
@@ -61,6 +63,7 @@ Same pattern as [telegram-bot-mcp](https://github.com/afonsofigs/telegram-bot-mc
 - **Auto-approve** — no login page; security by fixed credentials
 - **PKCE** (S256) mandatory
 - **Redirect URIs** limited to `claude.ai` and `claude.com`
+- **File-persisted token store** — Authorization codes and bearer/refresh tokens are written to `TOKEN_STORE_PATH` (default `/data/oauth-tokens.json`) on every mutation. Mount a volume at that location so connectors don't have to re-auth after pod restarts. If no volume is mounted, the path falls back to ephemeral container storage.
 
 ## Claude.ai Connector Setup
 
