@@ -22,9 +22,11 @@ if (!MCP_SECRET) {
 
 // --- Start obsidian-sync-mcp backend ---
 
+// HOST pins the backend to loopback: it must only ever be reachable through our
+// OAuth proxy on :3000, never directly from other pods on the cluster network.
 const backend = spawn("node", ["backend-wrapper.js"], {
   stdio: ["ignore", "pipe", "pipe"],
-  env: { ...process.env, PORT: String(BACKEND_PORT) },
+  env: { ...process.env, PORT: String(BACKEND_PORT), HOST: "127.0.0.1" },
 });
 
 backend.stdout.on("data", (d) => process.stdout.write(`[backend] ${d}`));
@@ -49,6 +51,8 @@ console.log(`Backend ready at ${BACKEND_URL}`);
 
 // --- Discover tools from backend ---
 
+let backendInstructions;
+
 async function backendMcpCall(method, params = {}) {
   // Initialize session
   const initRes = await fetch(`${BACKEND_URL}/mcp`, {
@@ -70,8 +74,19 @@ async function backendMcpCall(method, params = {}) {
     }),
   });
 
-  await initRes.text();
+  const initText = await initRes.text();
   const sessionId = initRes.headers.get("mcp-session-id");
+
+  // Capture the backend's instructions once, so MCP_INSTRUCTIONS / vault
+  // conventions set on obsidian-sync-mcp reach the client through this proxy.
+  if (backendInstructions === undefined) {
+    try {
+      const m = initText.match(/data: (.+)/);
+      backendInstructions = JSON.parse(m ? m[1] : initText).result?.instructions ?? null;
+    } catch {
+      backendInstructions = null;
+    }
+  }
 
   // Send initialized notification
   await fetch(`${BACKEND_URL}/mcp`, {
@@ -280,7 +295,10 @@ class OAuthProvider {
 // --- MCP Server (proxy tools to backend) ---
 
 function createMcpServer() {
-  const server = new McpServer({ name: "obsidian-couchdb-mcp", version: "2.0.0" });
+  const server = new McpServer(
+    { name: "obsidian-couchdb-mcp", version: "2.0.0" },
+    backendInstructions ? { instructions: backendInstructions } : undefined,
+  );
 
   // Register each backend tool as a proxy
   for (const tool of backendTools) {
@@ -337,9 +355,21 @@ app.use((req, _res, next) => {
 // Health (unauthenticated) — also checks backend
 app.get("/health", async (_, res) => {
   try {
-    const r = await fetch(`${BACKEND_URL}/health`);
-    const body = await r.json();
-    res.json({ ok: body.ok !== false, version: "2.0.0", backend: true });
+    const r = await fetch(`${BACKEND_URL}/health`, {
+      headers: process.env.MCP_AUTH_TOKEN
+        ? { Authorization: `Bearer ${process.env.MCP_AUTH_TOKEN}` }
+        : {},
+    });
+    // The backend answers plain text ("✓ Ok"), not JSON, so parse defensively:
+    // treating it as JSON threw and made a healthy backend report as down.
+    const text = await r.text();
+    let ok = r.ok;
+    try {
+      ok = ok && JSON.parse(text).ok !== false;
+    } catch {
+      // non-JSON body is fine, the status code already told us
+    }
+    res.json({ ok, version: "2.0.0", backend: r.ok });
   } catch {
     res.json({ ok: false, version: "2.0.0", backend: false });
   }
