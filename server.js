@@ -126,6 +126,11 @@ console.log(`Discovered ${backendTools.length} tools: ${backendTools.map((t) => 
 
 const TOKEN_STORE_PATH = process.env.TOKEN_STORE_PATH || "/data/oauth-tokens.json";
 
+// Authorization codes are single-use and short-lived; RFC 6749 caps them at ten
+// minutes. Anything older is an abandoned flow.
+const CODE_TTL_MS = 10 * 60 * 1000;
+const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+
 const FIXED_CLIENT_ID = createHash("sha256").update(`${MCP_SECRET}:client_id`).digest("hex").slice(0, 36);
 const FIXED_CLIENT_SECRET = createHash("sha256").update(`${MCP_SECRET}:client_secret`).digest("hex");
 
@@ -134,16 +139,56 @@ class TokenStore {
     this.filePath = filePath;
     this.data = { tokens: {}, codes: {} };
     this._load();
+    this._prune();
+    // Restarts alone are not a reliable broom: a pod can run for months.
+    // unref so this timer never keeps the process alive on shutdown.
+    this.pruneTimer = setInterval(() => this._prune(), PRUNE_INTERVAL_MS);
+    this.pruneTimer.unref();
   }
 
   _load() {
     try {
       if (existsSync(this.filePath)) {
-        this.data = JSON.parse(readFileSync(this.filePath, "utf-8"));
+        const parsed = JSON.parse(readFileSync(this.filePath, "utf-8"));
+        this.data = {
+          tokens: parsed?.tokens ?? {},
+          codes: parsed?.codes ?? {},
+        };
       }
     } catch (err) {
       console.warn(`[tokenstore] Failed to load ${this.filePath}: ${err.message}, starting fresh`);
       this.data = { tokens: {}, codes: {} };
+    }
+  }
+
+  // An expired access token is otherwise only dropped when someone tries to use
+  // it (see verifyAccessToken), so tokens nobody touches again stay on disk
+  // forever. Four months of that left 101 dead entries out of 104.
+  _prune() {
+    const now = Date.now();
+    let tokens = 0;
+    let codes = 0;
+
+    for (const [key, value] of Object.entries(this.data.tokens)) {
+      // Refresh tokens deliberately carry no expiry: they end by rotation in
+      // exchangeRefreshToken, or by revocation. Age must never drop them.
+      if (value?.type === "refresh") continue;
+      if (value?.expiresAt && value.expiresAt < now) {
+        delete this.data.tokens[key];
+        tokens++;
+      }
+    }
+
+    for (const [key, value] of Object.entries(this.data.codes)) {
+      if (value?.createdAt && now - value.createdAt > CODE_TTL_MS) {
+        delete this.data.codes[key];
+        codes++;
+      }
+    }
+
+    if (tokens || codes) {
+      console.log(`[tokenstore] pruned ${tokens} expired token(s), ${codes} stale code(s)`);
+      this._save();
     }
   }
 
