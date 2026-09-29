@@ -88,33 +88,47 @@ async function backendMcpCall(method, params = {}) {
     }
   }
 
-  // Send initialized notification
-  await fetch(`${BACKEND_URL}/mcp`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Accept": "application/json, text/event-stream",
-      "mcp-session-id": sessionId,
-      ...(process.env.MCP_AUTH_TOKEN ? { "Authorization": `Bearer ${process.env.MCP_AUTH_TOKEN}` } : {}),
-    },
-    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
-  });
+  try {
+    // Send initialized notification
+    await fetch(`${BACKEND_URL}/mcp`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "mcp-session-id": sessionId,
+        ...(process.env.MCP_AUTH_TOKEN ? { "Authorization": `Bearer ${process.env.MCP_AUTH_TOKEN}` } : {}),
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    });
 
-  // Call the method
-  const res = await fetch(`${BACKEND_URL}/mcp`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Accept": "application/json, text/event-stream",
-      "mcp-session-id": sessionId,
-      ...(process.env.MCP_AUTH_TOKEN ? { "Authorization": `Bearer ${process.env.MCP_AUTH_TOKEN}` } : {}),
-    },
-    body: JSON.stringify({ jsonrpc: "2.0", method, params, id: 2 }),
-  });
+    // Call the method
+    const res = await fetch(`${BACKEND_URL}/mcp`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "mcp-session-id": sessionId,
+        ...(process.env.MCP_AUTH_TOKEN ? { "Authorization": `Bearer ${process.env.MCP_AUTH_TOKEN}` } : {}),
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", method, params, id: 2 }),
+    });
 
-  const text = await res.text();
-  const match = text.match(/data: (.+)/);
-  return match ? JSON.parse(match[1]) : JSON.parse(text);
+    const text = await res.text();
+    const match = text.match(/data: (.+)/);
+    return match ? JSON.parse(match[1]) : JSON.parse(text);
+  } finally {
+    // Every call opens a backend session; left open, the backend keeps them
+    // forever and the pod's memory grows until it is OOM-killed.
+    if (sessionId) {
+      await fetch(`${BACKEND_URL}/mcp`, {
+        method: "DELETE",
+        headers: {
+          "mcp-session-id": sessionId,
+          ...(process.env.MCP_AUTH_TOKEN ? { "Authorization": `Bearer ${process.env.MCP_AUTH_TOKEN}` } : {}),
+        },
+      }).catch(() => {});
+    }
+  }
 }
 
 // Get available tools from backend
@@ -431,6 +445,16 @@ app.use(mcpAuthRouter({
 // Streamable HTTP transport for MCP
 const transports = new Map();
 
+/**
+ * Sessions live in memory, so a restart forgets every one of them while the
+ * clients still hold their ids. The spec's answer is 404, which tells a
+ * client to initialize a new session. Handing the request to a fresh
+ * transport instead gets a 400 "Server not initialized", and a claude.ai chat
+ * that was open across the restart then fails its tool calls outright.
+ */
+const unknownSession = (res) =>
+  res.status(404).json({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null });
+
 const authMiddleware = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   console.log(`[auth] ${req.method} ${req.path} auth=${authHeader ? authHeader.slice(0, 20) + "..." : "none"}`);
@@ -456,6 +480,8 @@ app.post("/mcp", authMiddleware, async (req, res) => {
     if (sessionId && transports.has(sessionId)) {
       const transport = transports.get(sessionId);
       await transport.handleRequest(req, res, req.body);
+    } else if (sessionId) {
+      unknownSession(res);
     } else {
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
@@ -478,9 +504,8 @@ app.post("/mcp", authMiddleware, async (req, res) => {
 
 app.get("/mcp", authMiddleware, async (req, res) => {
   const sessionId = req.headers["mcp-session-id"];
-  if (!sessionId || !transports.has(sessionId)) {
-    return res.status(400).json({ error: "Missing or invalid session ID" });
-  }
+  if (!sessionId) return res.status(400).json({ error: "Missing session ID" });
+  if (!transports.has(sessionId)) return unknownSession(res);
   await transports.get(sessionId).handleRequest(req, res);
 });
 
