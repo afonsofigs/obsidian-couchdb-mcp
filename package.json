@@ -1,7 +1,7 @@
 {
   "name": "obsidian-couchdb-mcp",
   "version": "2.0.0",
-  "description": "OAuth 2.1 proxy for obsidian-sync-mcp \u2014 Claude.ai connector for Obsidian via CouchDB (LiveSync)",
+  "description": "OAuth 2.1 proxy for obsidian-sync-mcp — Claude.ai connector for Obsidian via CouchDB (LiveSync)",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -24,12 +24,12 @@
   },
   "overrides": {
     "qs": "6.16.0",
-    "axios": "1.18.0",
+    "axios": "1.20.0",
     "form-data": "4.0.6",
-    "hono": "4.12.34",
-    "@hono/node-server": "1.19.15",
-    "ip-address": "10.3.1",
-    "fast-uri": "3.1.6",
-    "undici": "7.29.0"
+    "hono": "4.13.13",
+    "@hono/node-server": "1.19.17",
+    "ip-address": "10.7.4",
+    "fast-uri": "3.1.9",
+    "undici": "7.30.1"
   }
 }
