@@ -59,7 +59,9 @@ MCP_SECRET=your_secret SERVER_URL=http://localhost:3000 node server.js
 
 Same pattern as [telegram-bot-mcp](https://github.com/afonsofigs/telegram-bot-mcp):
 
-- **Fixed client credentials** derived from `MCP_SECRET` via SHA-256
+- **Fixed client credentials** derived from `MCP_SECRET` via SHA-256. No dynamic client registration (`/register` is neither served nor advertised): the credentials only reach a client by being pasted into its settings.
+- **Rotating `MCP_SECRET` revokes everything**: on startup, codes and tokens issued to the previous `client_id` are dropped from the token store, and a bearer token of another client is refused.
+- **Revocation**: `POST /revoke` (RFC 7009, client credentials required) revokes an access or refresh token, only when it belongs to the authenticated client.
 - **Auto-approve** — no login page; security by fixed credentials
 - **PKCE** (S256) mandatory
 - **Redirect URIs** limited to `claude.ai` and `claude.com`
@@ -71,7 +73,7 @@ Same pattern as [telegram-bot-mcp](https://github.com/afonsofigs/telegram-bot-mc
 2. Check logs for `client_id` and `client_secret`
 3. Go to [claude.ai/settings/connectors](https://claude.ai/settings/connectors)
 4. Add custom connector: URL `https://your-domain.com/mcp`
-5. Enter `client_id` and `client_secret` from logs
+5. Open **Advanced settings** and paste the `client_id` and `client_secret` from the logs there. They have to be entered by hand: the server does not support dynamic client registration, so a connector added without them cannot link.
 
 ## Architecture
 
